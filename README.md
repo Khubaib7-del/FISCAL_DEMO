@@ -10,8 +10,9 @@ graph LR
     B --> C[Stage 2: Denoise]
     C --> D[Stage 3: Warp & Align]
     D --> E[Stage 4: Upscale]
-    E --> F[Stage 5: Binarize]
-    F --> G[OCR-Ready Output]
+    E --> F[Grayscale Conversion]
+    F --> G[Stage 5: Binarize]
+    G --> H[OCR-Ready Output]
 ```
 
 ---
