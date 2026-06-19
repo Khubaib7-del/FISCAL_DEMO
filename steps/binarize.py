@@ -23,12 +23,11 @@ def execute_binarize(image_matrix: np.ndarray) -> np.ndarray:
     # CRITICAL MECHANICAL PARAMETERS:
     # 1. cv2.ADAPTIVE_THRESH_GAUSSIAN_C weights pixels closest to the center.
     # 2. blockSize=41 provides a broader context to ignore local illumination variations.
-    # 3. C=30 aggressively thins character strokes to eliminate 'heavy ink' effects.
+    # 3. C=10 preserves character connectivity (essential for Arabic).
     binary = cv2.adaptiveThreshold(
         gray_matrix, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 41, 30
+        cv2.THRESH_BINARY, 41, 10
     )
 
-    # NOISE STRIPPING: Remove small orphaned black pixels
-    kernel = np.ones((2, 2), np.uint8)
-    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    # NOISE STRIPPING: Disabled to prevent loss of small diacritics
+    return binary

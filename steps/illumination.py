@@ -17,8 +17,7 @@ def execute_illumination_correction(gray_matrix: np.ndarray) -> np.ndarray:
     # Step 3: Division for baseline normalization
     normalized = cv2.divide(output_matrix, bg_estimate, scale=255)
     
-    # Step 4: Soft Intensity Stretch (Avoid binary-look, keep some shades)
-    # We remove the hard thresholding at 230 to keep it 'natural'
-    output_matrix = cv2.normalize(normalized, None, 10, 255, cv2.NORM_MINMAX)
+    # Step 4: Full Intensity Stretch for VLM [0, 255]
+    output_matrix = cv2.normalize(normalized, None, 0, 255, cv2.NORM_MINMAX)
 
     return output_matrix

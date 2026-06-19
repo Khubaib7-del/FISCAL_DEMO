@@ -207,8 +207,8 @@ def apply_line_deskew(image):
 
     _, binary = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     best_angle, best_score = 0.0, -1.0
-
-    for angle in np.linspace(-5.0, 5.0, 200):
+    # Expanded range (±20.0°) to handle aggressive phone photo angles
+    for angle in np.linspace(-20.0, 20.0, 400):
         M = cv2.getRotationMatrix2D((rw // 2, rh // 2), angle, 1.0)
         rotated = cv2.warpAffine(binary, M, (rw, rh), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         score = float(np.var(np.sum(rotated, axis=1)))

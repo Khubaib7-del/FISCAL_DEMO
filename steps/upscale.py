@@ -8,6 +8,8 @@ def execute_upscale(image_matrix: np.ndarray) -> np.ndarray:
 
     height, width = image_matrix.shape[:2]
     if max(height, width) >= 4000:
+        import logging
+        logging.getLogger(__name__).debug(f"Upscale: Skipped — image resolution exceeded guard ({width}x{height})")
         return image_matrix
 
     # 1. High-fidelity interpolation resize expansion
