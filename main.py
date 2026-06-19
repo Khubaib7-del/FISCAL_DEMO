@@ -40,21 +40,19 @@ class DocumentPreprocessingLayer:
              logger.warning("Orientation: Content mass suggests image may be rotated 90/270 degrees.")
 
     def process_and_save_stages(self, matrix: np.ndarray, filename: str, corners: list = None):
-        """Executes the spec sequence and saves results to traceable stage folders."""
+        """Executes the spec sequence while preserving color for VLM recognition."""
         try:
             name, ext = os.path.splitext(filename)
             
-            # --- STAGE 0: NORMALIZATION ---
-            if len(matrix.shape) == 3:
-                processed = cv2.cvtColor(matrix, cv2.COLOR_BGR2GRAY)
-            else:
-                processed = matrix.copy()
+            # --- STAGE 0: INTEGRITY CHECK ---
+            processed = matrix.copy()
             
             # Check for 90-degree rotations
-            self._check_orientation_drift(processed)
+            gray_for_check = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY) if len(processed.shape) == 3 else processed
+            self._check_orientation_drift(gray_for_check)
 
             # Check if image is already a clean scan/CamScanner-enhanced
-            already_clean = self._is_already_enhanced(processed)
+            already_clean = self._is_already_enhanced(gray_for_check)
             if already_clean:
                 logger.info(f"Integrity: {filename} detected as already enhanced. Skipping redundant stages.")
 
