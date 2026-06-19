@@ -5,8 +5,7 @@ import logging
 def execute_warp(image_matrix: np.ndarray, corners: list = None) -> np.ndarray:
     """
     Stage 2: Precision Perspective & Leveling.
-    Round 3: Implements Text-Content Margin Anchoring to fix paper curl 
-    and progressive trapezoid distortion.
+    Implements multi-tiered boundary detection (Paper Blob, Document Hull, and Text-margin Fallback).
     """
     try:
         if image_matrix is None or image_matrix.size == 0:
@@ -14,28 +13,30 @@ def execute_warp(image_matrix: np.ndarray, corners: list = None) -> np.ndarray:
 
         # 1. Manual User Corners (Priority)
         if corners is not None and len(corners) == 4:
-            return apply_perspective_warp(image_matrix, np.float32(corners))
+            return apply_perspective_warp(image_matrix, np.float32(corners), margin_ratio=0.02, shrink_ratio=0.025)
         
-        # 2a. Document Hull Discovery (Standard Quad Detection)
+        # 2a. Paper Blob Discovery (Adaptive threshold sweep + Otsu dark-bg fallback)
+        doc_pts = detect_paper_blob_corners(image_matrix)
+        if doc_pts is not None:
+            logging.info("Warp: Receipt boundary detected via paper blob bounds.")
+            # margin_ratio=0.01: blob corners are tight to paper edge, minimal crop needed
+            # shrink_ratio=0.0: do not pre-shrink the quad — blob detection is already precise
+            warped = apply_perspective_warp(image_matrix, doc_pts, margin_ratio=0.01, shrink_ratio=0.0)
+            return apply_line_deskew(warped)
+
+        # 2b. Document Hull Discovery (Canny-based Quad Fallback)
         doc_pts = detect_document_hull_v2(image_matrix)
         if doc_pts is not None:
             logging.info("Warp: Document boundary detected via Quad Discovery.")
-            warped = apply_perspective_warp(image_matrix, doc_pts)
+            warped = apply_perspective_warp(image_matrix, doc_pts, margin_ratio=0.02, shrink_ratio=0.025)
             return apply_line_deskew(warped)
 
-        # 2b. Blob boundary detection (Dark background fallback)
-        doc_pts = detect_receipt_bounds(image_matrix)
-        if doc_pts is not None:
-            logging.info("Warp: Receipt boundary detected via blob bounds.")
-            warped = apply_perspective_warp(image_matrix, doc_pts)
-            return apply_line_deskew(warped)
-
-        # 2c. NEW: Text-content boundary corners (handles curl + trapezoid)
+        # 2c. Text-content boundary corners (handles cut-off edges)
         # This anchors the perspective transform to the actual start/end of text columns.
         doc_pts = detect_text_boundary_corners(image_matrix)
         if doc_pts is not None:
             logging.info("Warp: Using text-content boundary for perspective correction.")
-            return apply_perspective_warp(image_matrix, doc_pts)
+            return apply_perspective_warp(image_matrix, doc_pts, margin_ratio=0.02, shrink_ratio=0.0)
 
         # 3. Last resort: Projection-profile only deskew
         logging.info("Warp: All point detection failed. Falling back to projection-profile deskew.")
@@ -46,19 +47,33 @@ def execute_warp(image_matrix: np.ndarray, corners: list = None) -> np.ndarray:
         return image_matrix
 
 def detect_document_hull_v2(image):
-    """Adaptive quad detection using two-pass Canny thresholds."""
+    """Adaptive quad detection using two-pass dynamic Canny thresholds."""
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-    target_h = 1000
+    
+    # Scale dynamically to maintain high precision on larger images
+    target_h = 1500 if h >= 2000 else 1000
     scale = target_h / h
     resized = cv2.resize(gray, (int(w * scale), target_h))
 
+    # Dynamic Canny thresholds based on image median intensity
+    median_val = np.median(resized)
+    low_thresh = int(max(10, 0.66 * median_val))
+    high_thresh = int(min(255, 1.33 * median_val))
+    
+    threshold_pairs = [(low_thresh, high_thresh), (low_thresh // 2, high_thresh // 2)]
     best_approx = None
 
-    for low, high in [(30, 150), (10, 80)]:
+    # Dynamic morphological kernel size based on resized dimensions
+    k_size = int(min(resized.shape[:2]) * 0.02)
+    if k_size % 2 == 0:
+        k_size += 1
+    k_size = max(5, k_size)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+
+    for low, high in threshold_pairs:
         blurred = cv2.GaussianBlur(resized, (5, 5), 0)
         edged = cv2.Canny(blurred, low, high)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
         morphed = cv2.dilate(edged, kernel, iterations=2)
         morphed = cv2.morphologyEx(morphed, cv2.MORPH_CLOSE, kernel)
 
@@ -75,33 +90,126 @@ def detect_document_hull_v2(image):
             if len(approx) == 4:
                 best_approx = approx.squeeze().astype(np.float32) * (1.0 / scale)
                 break 
+            elif 5 <= len(approx) <= 8:
+                # Curled paper / rounded corners fallback: compute convex hull and force-approximate to quad
+                hull = cv2.convexHull(approx)
+                peri_hull = cv2.arcLength(hull, True)
+                approx_quad = cv2.approxPolyDP(hull, 0.02 * peri_hull, True)
+                if len(approx_quad) == 4:
+                    best_approx = approx_quad.squeeze().astype(np.float32) * (1.0 / scale)
+                    break
 
     return best_approx
 
-def detect_receipt_bounds(image):
-    """Fallback for receipt blobs. Skips if coverage > 85%."""
+def detect_paper_blob_corners(image):
+    """
+    Finds physical receipt corners via bilateral threshold sweep.
+    Falls back to Otsu for dark-background images (e.g. receipt on wooden table).
+    Returns None if no valid receipt boundary found.
+    """
+    h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-    h, w = gray.shape
 
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
+    # Resize to 400px long edge for fast threshold sweeping
+    scale = 400.0 / max(h, w)
+    small_h, small_w = int(h * scale), int(w * scale)
+    small = cv2.resize(gray, (small_w, small_h))
+    blurred_small = cv2.bilateralFilter(small, 9, 75, 75)
+
+    best_thresh = None
+    max_ratio = 0.0
+    prev_ratio = 0.0
+    best_c = None
+
+    # Sweep from bright to dark — first valid blob wins
+    for t in range(245, 95, -2):
+        _, thresh = cv2.threshold(blurred_small, t, 255, cv2.THRESH_BINARY)
+
+        # Clear 5px border to prevent blob merging with image edge
+        border_px = 5
+        thresh[0:border_px, :] = 0
+        thresh[small_h - border_px:small_h, :] = 0
+        thresh[:, 0:border_px] = 0
+        thresh[:, small_w - border_px:small_w] = 0
+
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            prev_ratio = 0.0
+            continue
+
+        c = max(cnts, key=cv2.contourArea)
+        area_ratio = cv2.contourArea(c) / (small_h * small_w)
+
+        # Dynamic jump detection to prevent background table bleed
+        if prev_ratio > 0.35:
+            jump_limit = 0.16 if prev_ratio < 0.60 else 0.10
+            if (area_ratio - prev_ratio) > jump_limit:
+                logging.info(f"Warp: Dynamic jump detected ({area_ratio:.3f} from {prev_ratio:.3f}). Stopping sweep.")
+                break
+
+        # FIXED: upper limit raised from 0.82 → 0.92
+        # Receipts filling 80-92% of frame are still valid crops
+        if 0.10 <= area_ratio <= 0.92 and area_ratio > max_ratio:
+            max_ratio = area_ratio
+            best_thresh = t
+            best_c = c
+
+        prev_ratio = area_ratio
+
+    # Otsu fallback for dark-background images (e.g. receipt on wooden table)
+    # Only fires when the sweep above found nothing
+    if best_thresh is None:
+        otsu_val, _ = cv2.threshold(blurred_small, 0, 255,
+                                     cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if otsu_val < 210:  # Only use Otsu when background is genuinely dark
+            best_thresh = int(otsu_val)
+            logging.info(f"Warp: Bilateral sweep failed. "
+                         f"Using Otsu threshold {best_thresh} for dark-background receipt.")
+            
+            # Re-generate threshold mask at Otsu value and find contour
+            _, thresh = cv2.threshold(blurred_small, best_thresh, 255, cv2.THRESH_BINARY)
+            border_px = 5
+            thresh[0:border_px, :] = 0
+            thresh[small_h - border_px:small_h, :] = 0
+            thresh[:, 0:border_px] = 0
+            thresh[:, small_w - border_px:small_w] = 0
+            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                best_c = max(cnts, key=cv2.contourArea)
+
+    if best_thresh is None or best_c is None:
+        logging.info("Warp: No valid receipt blob found in threshold sweep.")
         return None
 
-    c = max(cnts, key=cv2.contourArea)
-    area_ratio = cv2.contourArea(c) / (h * w)
-
-    if area_ratio < 0.05 or area_ratio > 0.85:
+    # Final sanity check — reject if blob covers entire image (no background separation)
+    final_ratio = cv2.contourArea(best_c) / (small_h * small_w)
+    if final_ratio < 0.05 or final_ratio > 0.97:
+        logging.info(f"Warp: Blob coverage {final_ratio:.2f} out of valid range. Skipping.")
         return None
 
-    rect = cv2.minAreaRect(c)
-    box = cv2.boxPoints(rect)
-    return box.astype(np.float32)
+    # Extract 4 corners using sum/diff method
+    pts = best_c.reshape(-1, 2)
+    corners = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    corners[0] = pts[np.argmin(s)]    # Top-Left
+    corners[2] = pts[np.argmax(s)]    # Bottom-Right
+    diff = np.diff(pts, axis=1)
+    corners[1] = pts[np.argmin(diff)] # Top-Right
+    corners[3] = pts[np.argmax(diff)] # Bottom-Left
+
+    # Scale corners back to full resolution
+    corners_full = corners / scale
+
+    logging.info(f"Warp: Blob corners found — "
+                 f"TL={corners_full[0]} TR={corners_full[1]} "
+                 f"BR={corners_full[2]} BL={corners_full[3]} "
+                 f"coverage={final_ratio:.2f}")
+    return corners_full
 
 def detect_text_boundary_corners(image):
     """
-    Finds the 4 corners of the receipt by fitting lines to the 
-    left and right text edges at top and bottom halves.
+    Finds the 4 corners of the receipt by locating the bounds of the text content
+    vertically and horizontally, fitting lines, and applying standard margins.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
     h, w = gray.shape
@@ -126,18 +234,27 @@ def detect_text_boundary_corners(image):
     left_pts = np.array(left_pts)
     right_pts = np.array(right_pts)
 
+    # Topmost and bottommost text rows (removes empty scanner borders at top/bottom)
+    min_y = np.min(left_pts[:, 1])
+    max_y = np.max(left_pts[:, 1])
+    content_h = max_y - min_y
+    y_padding = content_h * 0.03 # 3% height padding
+    
+    top_y = max(0, min_y - y_padding)
+    bottom_y = min(h, max_y + y_padding)
+
     def fit_line_endpoint(pts, y_target):
         coeffs = np.polyfit(pts[:, 1], pts[:, 0], 1)
         return float(np.polyval(coeffs, y_target))
 
-    # Ultra-wide padding (50% of width) to recover full margins
+    # Standard margin padding (8% of average text column width)
     est_width = np.median(right_pts[:, 0] - left_pts[:, 0])
-    padding = est_width * 0.50 
+    padding = est_width * 0.08 
 
-    tl_x = fit_line_endpoint(left_pts[:len(left_pts)//2],  h * 0.01) - padding
-    tr_x = fit_line_endpoint(right_pts[:len(right_pts)//2], h * 0.01) + padding
-    bl_x = fit_line_endpoint(left_pts[len(left_pts)//2:],  h * 0.99) - padding
-    br_x = fit_line_endpoint(right_pts[len(right_pts)//2:], h * 0.99) + padding
+    tl_x = fit_line_endpoint(left_pts[:len(left_pts)//2],  top_y) - padding
+    tr_x = fit_line_endpoint(right_pts[:len(right_pts)//2], top_y) + padding
+    bl_x = fit_line_endpoint(left_pts[len(left_pts)//2:],  bottom_y) - padding
+    br_x = fit_line_endpoint(right_pts[len(right_pts)//2:], bottom_y) + padding
 
     # Clamp to image boundaries
     tl_x, bl_x = max(0, tl_x), max(0, bl_x)
@@ -152,17 +269,21 @@ def detect_text_boundary_corners(image):
         return None
 
     corners = np.array([
-        [tl_x, h * 0.02],
-        [tr_x, h * 0.02],
-        [br_x, h * 0.98],
-        [bl_x, h * 0.98],
+        [tl_x, top_y],
+        [tr_x, top_y],
+        [br_x, bottom_y],
+        [bl_x, bottom_y],
     ], dtype=np.float32)
 
     logging.info(f"Warp: Text boundary corners found (TL={tl_x:.0f}, TR={tr_x:.0f})")
     return corners
 
-def apply_perspective_warp(image, src_pts):
-    """4-point perspective transform with a content-safe 2% margin."""
+def apply_perspective_warp(image, src_pts, margin_ratio=0.02, shrink_ratio=0.0):
+    """4-point perspective transform with dynamic content-safe margin and pre-warp quad shrinking."""
+    if shrink_ratio > 0.0:
+        center = np.mean(src_pts, axis=0)
+        src_pts = np.array([pt + shrink_ratio * (center - pt) for pt in src_pts], dtype=np.float32)
+
     rect = np.zeros((4, 2), dtype="float32")
     s = src_pts.sum(axis=1)
     rect[0] = src_pts[np.argmin(s)]
@@ -189,11 +310,12 @@ def apply_perspective_warp(image, src_pts):
     M = cv2.getPerspectiveTransform(rect, dst)
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
     
-    # CONTENT-SAFE: Reduce crop to 2% (avoids cutting text on content-anchored quads)
-    margin_w = int(0.02 * maxWidth)
-    margin_h = int(0.02 * maxHeight)
-    if margin_w > 0 and margin_h > 0:
-        warped = warped[margin_h:-margin_h, margin_w:-margin_w]
+    # CONTENT-SAFE: Reduce crop to target margin ratio (avoids cutting text on content-anchored quads)
+    if margin_ratio > 0.0:
+        margin_w = int(margin_ratio * maxWidth)
+        margin_h = int(margin_ratio * maxHeight)
+        if margin_w > 0 and margin_h > 0:
+            warped = warped[margin_h:-margin_h, margin_w:-margin_w]
         
     return warped
 
@@ -201,7 +323,9 @@ def apply_line_deskew(image):
     """Fine-grained deskew via middle-region projection profile variance."""
     (h, w) = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-    y_start, y_end = int(h * 0.25), int(h * 0.75)
+    # CHANGED: 15%-85% instead of 25%-75%
+    # Gives more text rows to measure from, handles larger tilts and short receipts
+    y_start, y_end = int(h * 0.15), int(h * 0.85)
     region = gray[y_start:y_end, :]
     rh, rw = region.shape
 

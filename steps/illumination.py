@@ -20,13 +20,28 @@ def execute_illumination_correction(image_matrix: np.ndarray) -> np.ndarray:
     else:
         target = image_matrix
 
-    # Step 2: Subtle CLAHE on Lightness
-    clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
+    # Step 2: Adaptive CLAHE on Lightness
+    std_dev = np.std(target)
+    if std_dev < 20.0:
+        clip_limit = 2.0
+    elif std_dev < 40.0:
+        clip_limit = 1.5
+    else:
+        clip_limit = 1.0
+        
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
     enhanced_l = clahe.apply(target)
 
-    # Step 3: Background Smoothing for normalization
-    dilated = cv2.dilate(enhanced_l, np.ones((7, 7), np.uint8))
-    bg_estimate = cv2.medianBlur(dilated, 21)
+    # Step 3: Dynamic Background Smoothing for normalization
+    # Kernels scale with image size to prevent character washout on high-res images
+    min_dim = min(enhanced_l.shape[:2])
+    blur_k = int(min_dim * 0.02) * 2 + 1
+    blur_k = max(9, blur_k)
+    
+    dilation_k = max(3, (blur_k // 3) | 1)
+    
+    dilated = cv2.dilate(enhanced_l, np.ones((dilation_k, dilation_k), np.uint8))
+    bg_estimate = cv2.medianBlur(dilated, blur_k)
     
     # Step 4: Division Normalization
     normalized = cv2.divide(enhanced_l, bg_estimate, scale=255)

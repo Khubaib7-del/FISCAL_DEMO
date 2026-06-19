@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import logging
 from PIL import Image
+# pyrefly: ignore [missing-import]
 from pdf2image import convert_from_path
 
 # Import the 5-stage modular processing pipeline steps
@@ -29,15 +30,41 @@ class DocumentPreprocessingLayer:
         ratio = extreme_pixels / matrix.size
         return ratio > 0.85
 
-    def _check_orientation_drift(self, matrix: np.ndarray):
-        """Simple projection profile check for 90-degree rotations."""
-        h, w = matrix.shape
+    def _correct_orientation(self, matrix: np.ndarray) -> np.ndarray:
+        """
+        Actively detects if the image is rotated 90 or 270 degrees
+        and corrects it to be upright (text lines horizontal).
+        """
+        h, w = matrix.shape[:2]
+        gray = cv2.cvtColor(matrix, cv2.COLOR_BGR2GRAY) if len(matrix.shape) == 3 else matrix
+        
         # Sample center region
-        region = matrix[h//4:3*h//4, w//4:3*w//4]
-        h_var = np.var(np.mean(region, axis=1)) # Horizontal rows
-        v_var = np.var(np.mean(region, axis=0)) # Vertical columns
-        if v_var > h_var * 1.5:
-             logger.warning("Orientation: Content mass suggests image may be rotated 90/270 degrees.")
+        region = gray[h//4:3*h//4, w//4:3*w//4]
+        h_var = np.var(np.mean(region, axis=1)) # Variance of horizontal row averages
+        v_var = np.var(np.mean(region, axis=0)) # Variance of vertical col averages
+        
+        # If vertical column variance is significantly higher, text is vertical (rotated 90 or 270)
+        if v_var > h_var * 1.3:
+            logger.info("Orientation: Vertical text lines detected. Rotating 90 degrees.")
+            rotated_cw = cv2.rotate(matrix, cv2.ROTATE_90_CLOCKWISE)
+            rot_gray = cv2.cvtColor(rotated_cw, cv2.COLOR_BGR2GRAY) if len(rotated_cw.shape) == 3 else rotated_cw
+            rh, rw = rot_gray.shape
+            rot_region = rot_gray[rh//4:3*rot_gray.shape[0]//4, rw//4:3*rot_gray.shape[1]//4]
+            rot_h_var = np.var(np.mean(rot_region, axis=1))
+            rot_v_var = np.var(np.mean(rot_region, axis=0))
+            
+            if rot_h_var > rot_v_var:
+                return rotated_cw
+            else:
+                return cv2.rotate(matrix, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        
+        # If landscape format, typically receipts should be rotated to portrait
+        # CHANGED: 1.2 → 1.5 — only rotate images that are clearly landscape (not near-square receipts)
+        if w > h * 1.5:
+            logger.info("Orientation: Landscape receipt detected. Rotating to portrait.")
+            return cv2.rotate(matrix, cv2.ROTATE_90_CLOCKWISE)
+            
+        return matrix
 
     def process_and_save_stages(self, matrix: np.ndarray, filename: str, corners: list = None):
         """Executes the spec sequence while preserving color for VLM recognition."""
@@ -45,11 +72,10 @@ class DocumentPreprocessingLayer:
             name, ext = os.path.splitext(filename)
             
             # --- STAGE 0: INTEGRITY CHECK ---
-            processed = matrix.copy()
+            # Correct orientation first
+            processed = self._correct_orientation(matrix)
             
-            # Check for 90-degree rotations
             gray_for_check = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY) if len(processed.shape) == 3 else processed
-            self._check_orientation_drift(gray_for_check)
 
             # Check if image is already a clean scan/CamScanner-enhanced
             already_clean = self._is_already_enhanced(gray_for_check)
@@ -75,13 +101,12 @@ class DocumentPreprocessingLayer:
             processed = execute_upscale(processed)
             cv2.imwrite(os.path.join("output/stage4_upscale", f"{name}_upscale{ext}"), processed)
             
-            # --- STAGE 5: BINARIZE (Debug/Visual ONLY) ---
-            # Binarization is kept for visual QA, but not passed as the primary production return.
-            debug_binary = execute_binarize(processed)
-            cv2.imwrite(os.path.join("output/stage5_binarize", f"{name}_binarize{ext}"), debug_binary)
+            # --- STAGE 5: BINARIZE (Magic Color Enhancement) ---
+            processed = execute_binarize(processed)
+            cv2.imwrite(os.path.join("output/stage5_binarize", f"{name}_binarize{ext}"), processed)
             
             logger.info(f"Success: {filename} preprocessed for VLM Ingestion.")
-            return processed # Return grayscale for VLM
+            return processed # Return Magic Color enhanced image for VLM
             
         except Exception as e:
             logger.error(f"Failed to process {filename}: {str(e)}")
