@@ -2,6 +2,8 @@
 
 This document provides the high-level system architecture and blueprint for the document preprocessing layer. The engine is optimized to prepare thermal receipts and invoices for downstream visual language models (such as **PaddleOCR-VL 1.6** and **Qwen2.5-VL**).
 
+![6-Stage Preprocessing Pipeline Diagram](file:///d:/Fiscal_Preprocessing/ap_preprocessor_v2/Doc/pipeline_architecture_v2.png)
+
 ---
 
 ## 1. Architectural Evolution: 4-Stage vs. 6-Stage Pipeline
